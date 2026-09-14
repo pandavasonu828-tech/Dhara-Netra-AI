@@ -1,5 +1,0 @@
-Pair 1: original_01.png <-> duplicate_01.png (identical content; expected MATCH for extracted fields)
-Pair 2: original_02.png <-> duplicate_02.png (identical content; expected MATCH for extracted fields)
-Pair 3: original_03.png <-> duplicate_03.png (identical content; expected MATCH for extracted fields)
-Pair 4: original_04.png <-> duplicate_04.png (identical content; expected MATCH for extracted fields)
-Pair 5: original_05.png <-> duplicate_05.png (identical content; expected MATCH for extracted fields)

@@ -35,8 +35,6 @@ def _require_auth():
 app = Flask(__name__)
 CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.dirname(BASE_DIR)
-FRONTEND_FOLDER = os.path.join(PROJECT_DIR, "Frontend")
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -59,14 +57,7 @@ def save_upload(file):
 
 @app.route("/")
 def home():
-    return send_from_directory(FRONTEND_FOLDER, "index.html")
-
-
-@app.route("/<path:filename>")
-def frontend_file(filename):
-    # Serve the static frontend from the same origin as Flask.
-    # API routes are matched by their explicit /api/... handlers above.
-    return send_from_directory(FRONTEND_FOLDER, filename)
+    return jsonify({"status": "success", "message": "DHARANETRA AI Backend is running"})
 
 
 
@@ -474,10 +465,7 @@ def request_too_large(error):
 
 
 if __name__ == "__main__":
-if __name__ == "__main__":
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", "5000"))
     print(f"DHARANETRA AI backend running at http://{host}:{port}")
     app.run(host=host, port=port, debug=False)
-
-

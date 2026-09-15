@@ -15,8 +15,11 @@ ast.parse(app)
 ast.parse(ocr)
 
 assert 'port = int(os.environ.get("PORT", "5000"))' in app
-assert 'app.run(host="0.0.0.0", port=port, debug=True)' in app
-assert "0.0.0.0:${PORT:-10000}" in docker
+assert 'app.run(host=host, port=port, debug=False)' in app
+assert "--bind 0.0.0.0:${PORT:-10000}" in docker
+assert "0.0.0.0: --" not in docker
+assert "gunicorn --chdir Backend app:app" in docker
+assert "/health" in app
 assert "tesseract-ocr" in docker
 assert 'TESSERACT_CMD=/usr/bin/tesseract' in docker
 assert 'window.location.origin' in js

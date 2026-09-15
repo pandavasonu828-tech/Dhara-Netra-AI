@@ -1,0 +1,37 @@
+DHARA-NETRA AI — Docker Quick Start
+====================================
+
+Requirements
+------------
+1. Install Docker Desktop for Windows.
+2. Make sure Docker Desktop is running.
+
+Run the application
+-------------------
+1. Open PowerShell in this folder (the folder containing Dockerfile).
+2. Run:
+
+   docker compose up --build
+
+3. Wait until you see Gunicorn listening on 0.0.0.0:10000.
+4. Open this in your browser:
+
+   http://localhost:10000
+
+Stop the application
+--------------------
+Press Ctrl+C in the PowerShell window.
+
+Run again later
+---------------
+   docker compose up
+
+To rebuild after code changes
+-----------------------------
+   docker compose up --build
+
+Important
+---------
+- This Docker image installs Tesseract OCR automatically.
+- The project remains the same v18 prototype; Docker only packages the working app and its dependencies.
+- Aadhaar/OTP, government LRMS/GIS and other production integrations remain demo/prototype components as described in README.md.

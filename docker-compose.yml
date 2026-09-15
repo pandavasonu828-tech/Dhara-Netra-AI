@@ -1,0 +1,9 @@
+services:
+  dhara-netra-ai:
+    build: .
+    container_name: dhara-netra-ai
+    ports:
+      - "10000:10000"
+    environment:
+      PORT: "10000"
+    restart: unless-stopped

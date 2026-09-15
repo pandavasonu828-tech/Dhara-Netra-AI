@@ -3,7 +3,7 @@ from flask_cors import CORS
 import os, uuid, time, secrets, hashlib, re
 from werkzeug.utils import secure_filename
 from pipeline import process_document
-from ocr import extract_text
+from ocr import extract_text, tesseract_status
 from extract_fields import extract_fields
 from metrics import cer, wer, exact_match, precision_recall_f1, expected_calibration_error
 from lrms import search_records, chain, audit_events, audit, gis_parcel, link_candidate, append_record_from_verified, duplicate_candidates, register_document, create_review_case, review_cases, get_review_case, decide_review_case
@@ -80,7 +80,18 @@ def _require_role(role):
 
 @app.route("/api/test")
 def test():
-    return jsonify({"status": "success", "message": "Frontend and Flask backend can communicate"})
+    return jsonify({"status": "success", "message": "Dhara-Netra AI backend is reachable", "ocr": tesseract_status()})
+
+
+@app.route("/health")
+def health():
+    """Deployment health endpoint for Render and manual diagnostics."""
+    ocr = tesseract_status()
+    return jsonify({
+        "status": "ok" if ocr.get("available") else "degraded",
+        "service": "Dhara-Netra AI",
+        "ocr": ocr,
+    }), (200 if ocr.get("available") else 503)
 
 
 @app.route("/api/request-otp", methods=["POST"])
@@ -463,7 +474,10 @@ def request_too_large(error):
 
 
 if __name__ == "__main__":
+if __name__ == "__main__":
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", "5000"))
     print(f"DHARANETRA AI backend running at http://{host}:{port}")
     app.run(host=host, port=port, debug=False)
+
+

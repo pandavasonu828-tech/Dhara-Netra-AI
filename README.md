@@ -86,3 +86,11 @@ The LRMS database and GIS geometry bundled here are **prototype/demo data**. The
 - LRMS History displays only explicit registered ownership/transfer records for the entered survey number.
 - A father/husband or other ancestor named on a document is relationship context, not proof of previous ownership.
 - The 145/2A jury demo contains one previous registered holder (Suryanarayana) and current holder (Ravi Kumar); the older unnamed Grandfather/Father placeholders were removed.
+
+## Hosted deployment diagnostics
+
+The same Flask application serves both the frontend and API in the Docker/Render deployment, so the browser uses the current site origin for `/api/...` requests. Render requires the web service to bind to `0.0.0.0`; the Dockerfile uses the `PORT` environment variable with a 10000 default.
+
+Health check: `/health` — reports whether Tesseract OCR is available in the running container.
+
+For local development, the backend can still be started from `Backend` with `python app.py`.

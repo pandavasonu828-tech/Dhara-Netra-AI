@@ -1,21 +1,26 @@
 """OCR runtime for Dhara-Netra AI.
 
-The same code runs on Windows and in the Linux Docker/Render container.
-Tesseract is discovered from the environment/PATH instead of assuming a
-Windows installation path.
+Render/free containers have limited CPU and memory.  The production-shaped
+prototype therefore keeps OCR bounded: uploaded images are resized before
+processing, Tesseract calls have hard timeouts, and token-confidence extraction
+fails soft instead of killing the web worker.
 """
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import pytesseract
 import os
 import shutil
 
+# Keep the OCR request bounded on small Render instances.
+MAX_OCR_DIMENSION = int(os.environ.get("MAX_OCR_DIMENSION", "2200"))
+OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "30"))
+
 
 def _configure_tesseract():
     candidates = [
         os.environ.get("TESSERACT_CMD", "").strip(),
         shutil.which("tesseract") or "",
-        r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
-        r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
+        r"C:\\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\\Program Files (x86)\Tesseract-OCR\tesseract.exe",
     ]
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):
@@ -31,25 +36,62 @@ def tesseract_status():
     """Return a safe runtime diagnostic used by the health endpoint."""
     try:
         version = str(pytesseract.get_tesseract_version()).splitlines()[0].strip()
-        return {"available": True, "version": version, "command": pytesseract.pytesseract.tesseract_cmd}
+        return {
+            "available": True,
+            "version": version,
+            "command": pytesseract.pytesseract.tesseract_cmd,
+            "ocr_timeout_seconds": OCR_TIMEOUT_SECONDS,
+            "max_ocr_dimension": MAX_OCR_DIMENSION,
+        }
     except Exception as exc:
-        return {"available": False, "version": None, "command": pytesseract.pytesseract.tesseract_cmd, "error": str(exc)}
+        return {
+            "available": False,
+            "version": None,
+            "command": pytesseract.pytesseract.tesseract_cmd,
+            "error": str(exc),
+            "ocr_timeout_seconds": OCR_TIMEOUT_SECONDS,
+            "max_ocr_dimension": MAX_OCR_DIMENSION,
+        }
+
+
+def _load_for_ocr(image_path):
+    """Load an image and bound its size so OCR cannot consume excessive CPU/RAM."""
+    try:
+        image = Image.open(image_path).convert("RGB")
+    except Exception as exc:
+        raise RuntimeError(f"Unable to open uploaded image: {exc}") from exc
+
+    if max(image.size) > MAX_OCR_DIMENSION:
+        image.thumbnail((MAX_OCR_DIMENSION, MAX_OCR_DIMENSION), Image.Resampling.LANCZOS)
+    return image
 
 
 def _run_ocr(image, config="--psm 6"):
     try:
-        return pytesseract.image_to_string(image, config=config).strip()
+        return pytesseract.image_to_string(
+            image,
+            config=config,
+            timeout=OCR_TIMEOUT_SECONDS,
+        ).strip()
     except pytesseract.TesseractNotFoundError as exc:
         raise RuntimeError(
             "Tesseract OCR is not available in the server runtime. "
             "The Docker image must install tesseract-ocr."
         ) from exc
+    except RuntimeError as exc:
+        # pytesseract uses RuntimeError for its subprocess timeout.
+        if "timeout" in str(exc).lower():
+            raise RuntimeError(
+                f"OCR timed out after {OCR_TIMEOUT_SECONDS} seconds. "
+                "The image was too complex for the available server resources."
+            ) from exc
+        raise RuntimeError(f"Tesseract OCR failed: {exc}") from exc
     except Exception as exc:
         raise RuntimeError(f"Tesseract OCR failed: {exc}") from exc
 
 
 def preprocess_image(image_path):
-    image = Image.open(image_path).convert("RGB")
+    image = _load_for_ocr(image_path)
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray)
     gray = gray.filter(ImageFilter.MedianFilter(size=3))
@@ -69,41 +111,50 @@ def _ocr_score(text):
 
 
 def extract_text(image_path):
-    """Run OCR with a conservative original-image pass plus a fallback pass.
+    """Run one bounded OCR pass on the original image.
 
-    The original image is preferred because aggressive preprocessing can change
-    survey identifiers such as 145/2A into 145/24.
+    Earlier versions performed two full OCR passes here and then another
+    image_to_data pass.  On a free Render worker that could exceed Gunicorn's
+    request timeout and cause the worker to be killed.  A bounded original-image
+    pass preserves identifiers better while avoiding that failure mode.
     """
-    try:
-        image = Image.open(image_path).convert("RGB")
-    except Exception as exc:
-        raise RuntimeError(f"Unable to open uploaded image: {exc}") from exc
-
+    image = _load_for_ocr(image_path)
     original = _run_ocr(image, config="--psm 6")
-    candidates = [original]
-
-    # Only use enhancement as a fallback/candidate. This helps faded scans while
-    # preserving the original OCR result when it contains useful field labels.
-    try:
+    if not original.strip():
+        # Only pay for enhancement if the original produced nothing.
         enhanced = preprocess_image(image_path)
-        candidates.append(_run_ocr(enhanced, config="--psm 6"))
-    except Exception:
-        # Original OCR is still useful; do not hide its result because an optional
-        # enhancement pass failed.
-        pass
+        original = _run_ocr(enhanced, config="--psm 6")
 
-    best = max(candidates, key=_ocr_score, default="")
-    if not best.strip():
-        raise RuntimeError("OCR returned no readable text from the uploaded image. Try a clearer JPG/PNG scan.")
-    return best
+    if not original.strip():
+        raise RuntimeError(
+            "OCR returned no readable text from the uploaded image. "
+            "Try a clearer JPG/PNG scan."
+        )
+    return original
 
 
 def extract_ocr_token_confidence(image_path):
-    image = Image.open(image_path).convert("RGB")
+    """Return token confidence data using one additional bounded OCR pass.
+
+    If this optional diagnostic pass times out, return an empty list so the
+    document can still be processed instead of terminating the request.
+    """
+    image = _load_for_ocr(image_path)
     try:
-        data = pytesseract.image_to_data(image, config="--psm 6", output_type=pytesseract.Output.DICT)
+        data = pytesseract.image_to_data(
+            image,
+            config="--psm 6",
+            output_type=pytesseract.Output.DICT,
+            timeout=OCR_TIMEOUT_SECONDS,
+        )
     except pytesseract.TesseractNotFoundError as exc:
         raise RuntimeError("Tesseract OCR is not available in the server runtime.") from exc
+    except Exception as exc:
+        # Confidence is supplementary. Never fail an otherwise valid OCR result
+        # because this optional pass is slow or unavailable.
+        print(f"[OCR] token-confidence pass skipped: {exc}")
+        return []
+
     rows = []
     for i, raw in enumerate(data["text"]):
         word = (raw or "").strip()

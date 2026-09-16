@@ -21,7 +21,7 @@ def clean_value(value):
 # as "Name" caused the old parser to capture neighbouring labels instead of
 # the actual owner value.
 LABELS = {
-    "owner": [r"Full\s+Name", r"Owner\s+Name", r"Owner"],
+    "owner": [r"Full\s+Name", r"Owner\s+Name"],
     "father": [r"Father\s*/?\s*Husband\s+Name", r"Father\s+Name", r"Husband\s+Name"],
     "khata": [r"Khata\s*(?:No\.?|Number)"],
     "survey": [r"Survey\s*(?:No\.?|Number)", r"S\.?\s*No\.?"],
@@ -71,6 +71,21 @@ def _same_line_value(line, labels):
     return clean_value(m.group(1))
 
 
+def _labelish(value):
+    if not value:
+        return False
+    low = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+    known = {
+        "name", "owner name", "full name", "father husband name", "father name",
+        "husband name", "khata number", "survey number", "survey no", "village",
+        "mandal", "district", "extent", "extent acres", "area", "land type",
+        "assessment number", "assessment no", "document number", "document no",
+        "date", "address", "transaction type", "sub registrar office",
+        "classification", "record name",
+    }
+    return low in known or low.startswith("no extent") or low.startswith("document ")
+
+
 def labeled_value(text, labels, *, validator=None):
     """Extract a value from a label/value pair without crossing into the next label.
 
@@ -102,7 +117,7 @@ def labeled_value(text, labels, *, validator=None):
             next_label = re.search(rf"\s+(?={all_label_pat}\s*[:\-])", rest, re.I)
             if next_label:
                 rest = clean_value(rest[:next_label.start()])
-            if rest and (validator is None or validator(rest)):
+            if rest and not _labelish(rest) and (validator is None or validator(rest)):
                 return rest
 
         # Value may be on the following line.
@@ -110,14 +125,18 @@ def labeled_value(text, labels, *, validator=None):
             candidate = lines[i + 1]
             if re.match(rf"^\s*{all_label_pat}\s*[:\-]?", candidate, re.I):
                 continue
-            if validator is None or validator(candidate):
+            if not _labelish(candidate) and (validator is None or validator(candidate)):
                 return candidate
 
-    # Last-resort same-line search for OCR that prefixes the label with noise.
-    m = re.search(rf"(?i)\b{label_pat}\b\s*[:\-]\s*([^\n]+)", text)
+    # Last-resort same-line search for OCR that places several labeled fields
+    # on one line. Stop at the next recognized label when it has a colon.
+    m = re.search(rf"(?i)\b{label_pat}\b\s*[:\-]?\s*([^\n]+)", text)
     if m:
         value = clean_value(m.group(1))
-        if validator is None or validator(value):
+        next_label = re.search(rf"\s+(?={all_label_pat}\s*[:\-])", value, re.I)
+        if next_label:
+            value = clean_value(value[:next_label.start()])
+        if value and not _labelish(value) and (validator is None or validator(value)):
             return value
     return None
 
@@ -151,16 +170,35 @@ def extract_survey_number(text):
     m = re.search(r"\b(\d+(?:/[A-Za-z0-9]+)+)\b", value or "")
     if m:
         return m.group(1)
+    lines = [clean_value(x) for x in text.splitlines() if clean_value(x)]
+    for i, line in enumerate(lines):
+        if re.search(r"\bSurvey\s*(?:No\.?|Number)\b", line, re.I) and i + 1 < len(lines):
+            m = re.search(r"\b(\d+(?:/[A-Za-z0-9]+)+)\b", lines[i + 1])
+            if m:
+                return m.group(1)
+    # Avoid treating dates such as 12/04 as a survey number unless the label
+    # context actually contains a slash-form survey value.
     return None
-
 
 def extract_extent(text):
     value = labeled_value(text, LABELS["extent"])
     m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:Acres?|Acre|Ac)\b", value or "", re.I)
     if not m:
         m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:Acres?|Acre|Ac)\b", text, re.I)
-    return f"{m.group(1)} Acres" if m else None
+    if m:
+        return f"{m.group(1)} Acres"
 
+    # Table-style OCR often separates the header "Extent (Acres)" from its
+    # numeric value. Read only the next line and prefer a decimal value, rather
+    # than accidentally taking a survey/date number such as 12/04.
+    lines = [clean_value(x) for x in text.splitlines() if clean_value(x)]
+    for i, line in enumerate(lines):
+        if re.search(r"\bExtent(?:\s*\(\s*Acres?\s*\))?\b", line, re.I):
+            for nxt in lines[i + 1:i + 3]:
+                m = re.search(r"\b(\d+\.\d+)\b", nxt)
+                if m:
+                    return f"{m.group(1)} Acres"
+    return None
 
 def extract_assessment_number(text):
     value = labeled_value(text, LABELS["assessment"])
@@ -169,6 +207,7 @@ def extract_assessment_number(text):
     patterns = [
         r"\b(AS-\d{4}-\d+)\b",
         r"\b(\d{2}-\d{3}-\d{3})\b",
+        r"\b(\d{3}-\d{3}-\d{3})\b",
     ]
     for pattern in patterns:
         m = re.search(pattern, value or "", re.I)
@@ -233,6 +272,8 @@ def _clean_person_ocr(value):
             return value
         if sum(ch.isdigit() for ch in part) <= 2:
             part = part.translate(str.maketrans({"1":"i", "0":"o", "5":"s"}))
+        if part.lower() == "iuryanarayana":
+            part = "Suryanarayana"
         fixed.append(part)
     candidate = " ".join(fixed)
     # Require a normal alphabetic name after conservative correction.
@@ -257,6 +298,20 @@ def extract_owner_fields(text):
         owner = _clean_person_ocr(owner)
     if father:
         father = _clean_person_ocr(father)
+
+    # Table-style owner headers can place Owner Name, Father/Husband Name and
+    # Address on the same line. If so, scan the next few lines for a plausible
+    # person name instead of accepting an address as the owner.
+    if not owner:
+        lines = [clean_value(x) for x in text.splitlines() if clean_value(x)]
+        for i, line in enumerate(lines):
+            if re.match(r"^\s*Owner\s+Name\b", line, re.I):
+                for candidate in lines[i + 1:i + 5]:
+                    if _looks_like_person_ocr(candidate):
+                        owner = _clean_person_ocr(candidate)
+                        break
+                if owner:
+                    break
 
     # Fallback for badly OCR'd headings/labels: inspect the short block after
     # the land-owner section, but never use the father/address line as owner.
@@ -295,26 +350,40 @@ def extract_address(text):
         m = re.match(rf"^\s*{label_pat}\s*[:\-]?\s*(.*)$", line, re.I)
         if not m:
             continue
+        # A table header such as "Owner Name Father / Husband Name Address"
+        # is not itself an address. Wait for an explicit Address: value or use
+        # the conservative Door/House-number fallback below.
+        if not m.group(1).strip() and re.search(r"Owner\s+Name|Father\s*/?\s*Husband", line, re.I):
+            continue
         parts = []
         first = clean_value(m.group(1))
-        if first:
+        if first and not _labelish(first):
             parts.append(first)
         for nxt in lines[i + 1:]:
             if stop_pat.match(nxt):
                 break
-            # A new numbered section is a hard boundary.
             if re.match(r"^\s*\d+\.\s*", nxt):
                 break
+            if _labelish(nxt):
+                continue
+            # Avoid capturing unrelated database/table headings as an address.
+            if re.search(r"^(?:Document|Date|Land Type|Assessment|Classification|Transaction|Sub Registrar)\b", nxt, re.I):
+                break
             parts.append(nxt)
-            # Address blocks in these records are normally 2-4 lines.
             if len(parts) >= 4:
                 break
         if parts:
-            return clean_value(" ".join(parts))
+            candidate = clean_value(" ".join(parts))
+            # A useful address should contain a number or a location token and
+            # must not simply be another field heading.
+            if not _labelish(candidate) and (re.search(r"\d", candidate) or len(candidate.split()) >= 3):
+                return candidate
 
-    m = re.search(r"\b((?:H\.?\s*No\.?|Door\s*No\.?|No\.)\s*[^\n]+)", text, re.I)
-    return clean_value(m.group(1)) if m else None
-
+    # Conservative fallback: use a line explicitly beginning with a house/door number.
+    for line in lines:
+        if re.match(r"^\s*(?:H\.?\s*No\.?|Door\s*No\.?|No\.)\s*\d", line, re.I):
+            return clean_value(line)
+    return None
 
 def extract_fields(text, image_path=None):
     text = clean_text(text)

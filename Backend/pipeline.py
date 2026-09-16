@@ -47,7 +47,15 @@ def _compare(field, user_value, extracted_value):
 
 def process_document(image_path, citizen_data=None):
     citizen_data = citizen_data or {}
-    text = extract_text(image_path)
+    ocr_error = None
+    try:
+        text = extract_text(image_path)
+    except Exception as exc:
+        # Graceful degradation: never turn an unreadable document into a server
+        # crash. Preserve the original upload and return an explicit review state.
+        text = ""
+        ocr_error = str(exc)
+
     ocr_tokens = [] if os.environ.get("SKIP_OCR_TOKEN_CONFIDENCE", "1") == "1" else extract_ocr_token_confidence(image_path)
     fields, handwriting_evidence = extract_fields(text, image_path)
     validation = validate_record(fields)
@@ -74,7 +82,6 @@ def process_document(image_path, citizen_data=None):
     # Prototype LRMS linkage: use extracted survey/location/owner evidence to
     # find the historical chain. This does not make a legal ownership decision.
     lrms_link = link_candidate(fields)
-    import os
     document_registry = register_document(image_path, os.path.basename(image_path), fields=fields)
     if lrms_link.get("linked"):
         audit("DOCUMENT_LINKED_TO_LRMS_HISTORY", lrms_link.get("best_match",{}).get("record_id"),
@@ -92,6 +99,9 @@ def process_document(image_path, citizen_data=None):
                 confidence[field]["components"]["handwriting_mode"] = ev.get("mode")
                 confidence[field]["reason"] = "Handwritten legacy form: template-assisted candidate; human verification required"
     return {
+        "processing_status": "NEEDS_REVIEW" if ocr_error else "PROCESSED",
+        "ocr_status": "FAILED_SAFE" if ocr_error else "COMPLETED",
+        "ocr_error": ocr_error,
         "ocr_text": text,
         "fields": fields,
         "validation": validation,

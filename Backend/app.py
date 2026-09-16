@@ -36,11 +36,22 @@ app = Flask(__name__)
 CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "pdf"}
 MAX_FILE_SIZE = 10 * 1024 * 1024
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+@app.errorhandler(413)
+def request_too_large(_exc):
+    return jsonify({"status":"error", "message":"The uploaded document is larger than the 10 MB prototype limit."}), 413
+
+
+@app.errorhandler(500)
+def internal_error(exc):
+    app.logger.exception("Unhandled server error: %s", exc)
+    return jsonify({"status":"error", "message":"The server could not complete document processing. Check the document format and try again."}), 500
 
 
 def allowed_file(filename):
@@ -252,7 +263,7 @@ def process_upload():
     if not file.filename:
         return jsonify({"status": "error", "message": "No file selected."}), 400
     if not allowed_file(file.filename):
-        return jsonify({"status": "error", "message": "Current OCR prototype accepts JPG, JPEG or PNG."}), 400
+        return jsonify({"status": "error", "message": "Current OCR prototype accepts JPG, JPEG, PNG or PDF."}), 400
 
     filename, path = save_upload(file)
     citizen_data = {key: request.form.get(key, "").strip() for key in [
@@ -266,6 +277,12 @@ def process_upload():
             result["review_queue_status"] = "PENDING"
         return jsonify({"status": "success", "filename": filename, "message": "Document processed from the uploaded file.", **result})
     except Exception as exc:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+        app.logger.exception("Document processing failed: %s", exc)
         return jsonify({"status": "error", "message": f"Processing failed: {exc}"}), 500
 
 
@@ -342,7 +359,7 @@ def compare_documents():
         return jsonify({"status": "error", "message": "Upload both documents for comparison."}), 400
     a, b = request.files["document_a"], request.files["document_b"]
     if not allowed_file(a.filename) or not allowed_file(b.filename):
-        return jsonify({"status": "error", "message": "Current comparison prototype accepts JPG, JPEG or PNG."}), 400
+        return jsonify({"status": "error", "message": "Current comparison prototype accepts JPG, JPEG, PNG or PDF."}), 400
     name_a, path_a = save_upload(a)
     name_b, path_b = save_upload(b)
     try:
@@ -463,7 +480,7 @@ def duplicate_check_api():
         return jsonify({"status":"error","message":"Upload a document."}),400
     f=request.files["document"]
     if not allowed_file(f.filename):
-        return jsonify({"status":"error","message":"Current duplicate prototype accepts JPG, JPEG or PNG."}),400
+        return jsonify({"status":"error","message":"Current duplicate prototype accepts JPG, JPEG, PNG or PDF."}),400
     name,path=save_upload(f)
     fields,_=extract_fields(extract_text(path),path)
     reg,candidates=duplicate_candidates(path,fields)
@@ -474,10 +491,6 @@ def duplicate_check_api():
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
-
-@app.errorhandler(413)
-def request_too_large(error):
-    return jsonify({"status": "error", "message": "File is larger than 10 MB."}), 413
 
 
 if __name__ == "__main__":

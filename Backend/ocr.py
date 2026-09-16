@@ -1,26 +1,27 @@
-"""OCR runtime for Dhara-Netra AI.
+"""Bounded OCR runtime for Dhara-Netra AI.
 
-Render/free containers have limited CPU and memory.  The production-shaped
-prototype therefore keeps OCR bounded: uploaded images are resized before
-processing, Tesseract calls have hard timeouts, and token-confidence extraction
-fails soft instead of killing the web worker.
+The hosted prototype must fail safely on small/free instances. OCR is deliberately
+bounded by image size, page count and subprocess timeouts. PDF pages are rendered
+one at a time so a large PDF cannot be loaded into memory all at once.
 """
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
-import pytesseract
 import os
 import shutil
+import tempfile
+import pytesseract
 
-# Keep the OCR request bounded on small Render instances.
-MAX_OCR_DIMENSION = int(os.environ.get("MAX_OCR_DIMENSION", "1400"))
-OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "15"))
+MAX_OCR_DIMENSION = int(os.environ.get("MAX_OCR_DIMENSION", "1200"))
+OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "8"))
+PDF_MAX_PAGES = int(os.environ.get("PDF_MAX_PAGES", "3"))
+PDF_RENDER_SCALE = float(os.environ.get("PDF_RENDER_SCALE", "1.25"))
 
 
 def _configure_tesseract():
     candidates = [
         os.environ.get("TESSERACT_CMD", "").strip(),
         shutil.which("tesseract") or "",
-        r"C:\\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"C:\\Program Files\\Tesseract-OCR\tesseract.exe",
+        r"C:\\Program Files (x86)\\Tesseract-OCR\tesseract.exe",
     ]
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):
@@ -33,7 +34,6 @@ TESSERACT_CMD = _configure_tesseract()
 
 
 def tesseract_status():
-    """Return a safe runtime diagnostic used by the health endpoint."""
     try:
         version = str(pytesseract.get_tesseract_version()).splitlines()[0].strip()
         return {
@@ -42,6 +42,7 @@ def tesseract_status():
             "command": pytesseract.pytesseract.tesseract_cmd,
             "ocr_timeout_seconds": OCR_TIMEOUT_SECONDS,
             "max_ocr_dimension": MAX_OCR_DIMENSION,
+            "pdf_max_pages": PDF_MAX_PAGES,
         }
     except Exception as exc:
         return {
@@ -51,122 +52,133 @@ def tesseract_status():
             "error": str(exc),
             "ocr_timeout_seconds": OCR_TIMEOUT_SECONDS,
             "max_ocr_dimension": MAX_OCR_DIMENSION,
+            "pdf_max_pages": PDF_MAX_PAGES,
         }
 
 
-def _load_for_ocr(image_path):
-    """Load an image and bound its size so OCR cannot consume excessive CPU/RAM."""
-    try:
-        image = Image.open(image_path).convert("RGB")
-    except Exception as exc:
-        raise RuntimeError(f"Unable to open uploaded image: {exc}") from exc
-
+def _bound_image(image):
+    image = image.convert("RGB")
     if max(image.size) > MAX_OCR_DIMENSION:
         image.thumbnail((MAX_OCR_DIMENSION, MAX_OCR_DIMENSION), Image.Resampling.LANCZOS)
     return image
 
 
-def _run_ocr(image, config="--psm 6"):
+def _load_image(image_path):
+    try:
+        return _bound_image(Image.open(image_path))
+    except Exception as exc:
+        raise RuntimeError(f"Unable to open uploaded image: {exc}") from exc
+
+
+def _run_ocr(image, timeout=None):
+    timeout = timeout or OCR_TIMEOUT_SECONDS
     try:
         return pytesseract.image_to_string(
             image,
-            config=config,
-            timeout=OCR_TIMEOUT_SECONDS,
+            config="--psm 3",
+            timeout=timeout,
         ).strip()
     except pytesseract.TesseractNotFoundError as exc:
         raise RuntimeError(
-            "Tesseract OCR is not available in the server runtime. "
-            "The Docker image must install tesseract-ocr."
+            "Tesseract OCR is not available in the server runtime."
         ) from exc
     except RuntimeError as exc:
-        # pytesseract uses RuntimeError for its subprocess timeout.
         if "timeout" in str(exc).lower():
-            raise RuntimeError(
-                f"OCR timed out after {OCR_TIMEOUT_SECONDS} seconds. "
-                "The image was too complex for the available server resources."
-            ) from exc
+            raise TimeoutError(f"OCR timed out after {timeout} seconds") from exc
         raise RuntimeError(f"Tesseract OCR failed: {exc}") from exc
     except Exception as exc:
         raise RuntimeError(f"Tesseract OCR failed: {exc}") from exc
 
 
-def preprocess_image(image_path):
-    image = _load_for_ocr(image_path)
-    gray = ImageOps.grayscale(image)
-    gray = ImageOps.autocontrast(gray)
-    gray = gray.filter(ImageFilter.MedianFilter(size=3))
-    gray = ImageEnhance.Contrast(gray).enhance(1.25)
-    return gray
-
-
-def _ocr_score(text):
-    if not text:
-        return 0
-    labels = (
-        "owner", "survey", "village", "district", "mandal", "extent",
-        "land", "assessment", "document", "address", "father", "government"
-    )
-    low = text.lower()
-    return len(text) + sum(80 for label in labels if label in low)
-
-
-def extract_text(image_path):
-    """Run bounded OCR suitable for a small Render instance.
-
-    The first pass uses a downscaled original image to preserve identifiers
-    while keeping CPU/RAM bounded. If that pass times out, a smaller sparse
-    text pass is attempted instead of letting the web worker hang.
-    """
-    image = _load_for_ocr(image_path)
+def _extract_pdf_text(pdf_path):
     try:
-        text = _run_ocr(image, config="--psm 6")
-    except RuntimeError as exc:
-        if "timed out" not in str(exc).lower():
-            raise
-        # Last-resort pass for unusually complex scans (maps/stamps/backgrounds).
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        raise RuntimeError("PDF support is unavailable in this deployment.") from exc
+
+    try:
+        doc = fitz.open(pdf_path)
+        if doc.page_count == 0:
+            raise RuntimeError("The uploaded PDF contains no pages.")
+        total_pages = doc.page_count
+        page_count = min(total_pages, PDF_MAX_PAGES)
+        chunks = []
+        for index in range(page_count):
+            page = doc.load_page(index)
+            pix = page.get_pixmap(matrix=fitz.Matrix(PDF_RENDER_SCALE, PDF_RENDER_SCALE), alpha=False)
+            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            image = _bound_image(image)
+            try:
+                text = _run_ocr(image)
+            except TimeoutError:
+                # A PDF page that is too complex gets one smaller, faster pass.
+                image.thumbnail((850, 850), Image.Resampling.LANCZOS)
+                try:
+                    text = _run_ocr(image, timeout=4)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"OCR could not process PDF page {index + 1} within the hosted resource limit."
+                    ) from exc
+            if text:
+                chunks.append(f"[PAGE {index + 1}]\n{text}")
+        doc.close()
+        if not chunks:
+            raise RuntimeError("OCR found no readable text in the uploaded PDF.")
+        if total_pages > PDF_MAX_PAGES:
+            chunks.append(f"[SYSTEM NOTE] Only the first {PDF_MAX_PAGES} pages were processed by the prototype.")
+        return "\n\n".join(chunks)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Unable to process PDF: {exc}") from exc
+
+
+def extract_text(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        return _extract_pdf_text(file_path)
+
+    image = _load_image(file_path)
+    try:
+        text = _run_ocr(image)
+    except TimeoutError:
         fallback = image.copy()
-        fallback.thumbnail((900, 900), Image.Resampling.LANCZOS)
+        fallback.thumbnail((850, 850), Image.Resampling.LANCZOS)
         try:
-            text = pytesseract.image_to_string(
-                fallback, config="--psm 11", timeout=10
-            ).strip()
-        except Exception as fallback_exc:
+            text = _run_ocr(fallback, timeout=4)
+        except Exception as exc:
             raise RuntimeError(
                 "OCR could not finish within the hosted resource limit. "
-                "Please upload a clearer JPG/PNG scan with less background detail."
-            ) from fallback_exc
+                "Try a clearer JPG/PNG scan with less background detail."
+            ) from exc
 
-    if not text.strip():
+    if not text:
         raise RuntimeError(
-            "OCR returned no readable text from the uploaded image. "
-            "Try a clearer JPG/PNG scan."
+            "OCR returned no readable text from the uploaded document. "
+            "Try a clearer scan."
         )
     return text
 
-def extract_ocr_token_confidence(image_path):
-    """Return token confidence data using one additional bounded OCR pass.
 
-    If this optional diagnostic pass times out, return an empty list so the
-    document can still be processed instead of terminating the request.
-    """
-    image = _load_for_ocr(image_path)
+def extract_ocr_token_confidence(file_path):
+    """Supplementary confidence data. It is intentionally disabled by default."""
+    if os.environ.get("SKIP_OCR_TOKEN_CONFIDENCE", "1") == "1":
+        return []
+    if os.path.splitext(file_path)[1].lower() == ".pdf":
+        return []
+    image = _load_image(file_path)
     try:
         data = pytesseract.image_to_data(
             image,
-            config="--psm 6",
+            config="--psm 3",
             output_type=pytesseract.Output.DICT,
             timeout=OCR_TIMEOUT_SECONDS,
         )
-    except pytesseract.TesseractNotFoundError as exc:
-        raise RuntimeError("Tesseract OCR is not available in the server runtime.") from exc
     except Exception as exc:
-        # Confidence is supplementary. Never fail an otherwise valid OCR result
-        # because this optional pass is slow or unavailable.
-        print(f"[OCR] token-confidence pass skipped: {exc}")
+        print(f"[OCR] optional token-confidence pass skipped: {exc}")
         return []
-
     rows = []
-    for i, raw in enumerate(data["text"]):
+    for i, raw in enumerate(data.get("text", [])):
         word = (raw or "").strip()
         try:
             conf = float(data["conf"][i])

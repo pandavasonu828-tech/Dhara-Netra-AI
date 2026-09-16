@@ -11,8 +11,8 @@ import os
 import shutil
 
 # Keep the OCR request bounded on small Render instances.
-MAX_OCR_DIMENSION = int(os.environ.get("MAX_OCR_DIMENSION", "2200"))
-OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "30"))
+MAX_OCR_DIMENSION = int(os.environ.get("MAX_OCR_DIMENSION", "1400"))
+OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "15"))
 
 
 def _configure_tesseract():
@@ -111,27 +111,37 @@ def _ocr_score(text):
 
 
 def extract_text(image_path):
-    """Run one bounded OCR pass on the original image.
+    """Run bounded OCR suitable for a small Render instance.
 
-    Earlier versions performed two full OCR passes here and then another
-    image_to_data pass.  On a free Render worker that could exceed Gunicorn's
-    request timeout and cause the worker to be killed.  A bounded original-image
-    pass preserves identifiers better while avoiding that failure mode.
+    The first pass uses a downscaled original image to preserve identifiers
+    while keeping CPU/RAM bounded. If that pass times out, a smaller sparse
+    text pass is attempted instead of letting the web worker hang.
     """
     image = _load_for_ocr(image_path)
-    original = _run_ocr(image, config="--psm 6")
-    if not original.strip():
-        # Only pay for enhancement if the original produced nothing.
-        enhanced = preprocess_image(image_path)
-        original = _run_ocr(enhanced, config="--psm 6")
+    try:
+        text = _run_ocr(image, config="--psm 6")
+    except RuntimeError as exc:
+        if "timed out" not in str(exc).lower():
+            raise
+        # Last-resort pass for unusually complex scans (maps/stamps/backgrounds).
+        fallback = image.copy()
+        fallback.thumbnail((900, 900), Image.Resampling.LANCZOS)
+        try:
+            text = pytesseract.image_to_string(
+                fallback, config="--psm 11", timeout=10
+            ).strip()
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                "OCR could not finish within the hosted resource limit. "
+                "Please upload a clearer JPG/PNG scan with less background detail."
+            ) from fallback_exc
 
-    if not original.strip():
+    if not text.strip():
         raise RuntimeError(
             "OCR returned no readable text from the uploaded image. "
             "Try a clearer JPG/PNG scan."
         )
-    return original
-
+    return text
 
 def extract_ocr_token_confidence(image_path):
     """Return token confidence data using one additional bounded OCR pass.

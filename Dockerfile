@@ -2,7 +2,10 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    TESSERACT_CMD=/usr/bin/tesseract
+    TESSERACT_CMD=/usr/bin/tesseract \
+    MAX_OCR_DIMENSION=1400 \
+    OCR_TIMEOUT_SECONDS=15 \
+    SKIP_OCR_TOKEN_CONFIDENCE=1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tesseract-ocr \

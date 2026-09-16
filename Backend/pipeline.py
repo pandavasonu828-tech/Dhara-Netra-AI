@@ -4,6 +4,7 @@ from validator import validate_record
 from confidence import calculate_confidence
 from lrms import register_document, link_candidate, audit
 import re
+import os
 
 def _compact(s):
     return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
@@ -47,7 +48,7 @@ def _compare(field, user_value, extracted_value):
 def process_document(image_path, citizen_data=None):
     citizen_data = citizen_data or {}
     text = extract_text(image_path)
-    ocr_tokens = extract_ocr_token_confidence(image_path)
+    ocr_tokens = [] if os.environ.get("SKIP_OCR_TOKEN_CONFIDENCE", "1") == "1" else extract_ocr_token_confidence(image_path)
     fields, handwriting_evidence = extract_fields(text, image_path)
     validation = validate_record(fields)
 

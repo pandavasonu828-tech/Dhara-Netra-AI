@@ -57,7 +57,23 @@ def save_upload(file):
 
 @app.route("/")
 def home():
-    return jsonify({"status": "success", "message": "DHARANETRA AI Backend is running"})
+    # Serve the actual frontend from the same Render origin so browser API calls
+    # using window.location.origin reach this Flask backend.
+    frontend_dir = os.path.join(BASE_DIR, "..", "Frontend")
+    return send_from_directory(frontend_dir, "index.html")
+
+
+@app.route("/<path:path>")
+def frontend_files(path):
+    # Serve frontend assets (for example script.js) from the same Render service.
+    # Keep unknown /api/* paths as JSON 404s instead of returning the HTML app.
+    if path.startswith("api/"):
+        return jsonify({"status": "error", "message": "API endpoint not found."}), 404
+    frontend_dir = os.path.join(BASE_DIR, "..", "Frontend")
+    requested = os.path.join(frontend_dir, path)
+    if os.path.isfile(requested):
+        return send_from_directory(frontend_dir, path)
+    return send_from_directory(frontend_dir, "index.html")
 
 
 
@@ -465,7 +481,6 @@ def request_too_large(error):
 
 
 if __name__ == "__main__":
-    host = "0.0.0.0"
     port = int(os.environ.get("PORT", "5000"))
-    print(f"DHARANETRA AI backend running at http://{host}:{port}")
-    app.run(host=host, port=port, debug=False)
+    print(f"DHARANETRA AI backend running on 0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=True)

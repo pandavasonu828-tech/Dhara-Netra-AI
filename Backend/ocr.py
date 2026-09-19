@@ -1,4 +1,3 @@
-
 """Bounded OCR runtime for Dhara-Netra AI.
 
 The hosted prototype must fail safely on small/free instances.
@@ -162,8 +161,7 @@ def _run_ocr(image, timeout=None):
 
 def _extract_pdf_text(pdf_path):
     try:
-        import fitz  # PyMuPDF
-
+        import fitz
     except ImportError as exc:
         raise RuntimeError(
             "PDF support is unavailable in this deployment."
@@ -225,9 +223,9 @@ def _extract_pdf_text(pdf_path):
 
                 except Exception as exc:
                     raise RuntimeError(
-                        f"OCR could not process PDF page "
-                        f"{index + 1} within the hosted "
-                        f"resource limit."
+                        f"OCR fallback failed for PDF page "
+                        f"{index + 1}: "
+                        f"{type(exc).__name__}: {exc}"
                     ) from exc
 
             if text:
@@ -298,10 +296,8 @@ def extract_text(file_path):
 
         except Exception as exc:
             raise RuntimeError(
-                "OCR could not finish within the hosted "
-                "resource limit. "
-                "Try a clearer JPG/PNG scan with less "
-                "background detail."
+                f"OCR fallback failed: "
+                f"{type(exc).__name__}: {exc}"
             ) from exc
 
     if not text:
@@ -331,11 +327,6 @@ def extract_ocr_token_confidence(file_path):
     ) == "1":
         return []
 
-    if os.path.splitext(
-        file_path
-    )[1].lower() == ".pdf":
-        return []
-
     image = _load_image(file_path)
 
     try:
@@ -343,37 +334,40 @@ def extract_ocr_token_confidence(file_path):
             image,
             config="--psm 3",
             output_type=pytesseract.Output.DICT,
-            timeout=OCR_TIMEOUT_SECONDS,
+            timeout=OCR_TIMEOUT_SECONDS
         )
 
     except Exception as exc:
-        print(
-            f"[OCR] optional token-confidence "
-            f"pass skipped: {exc}"
-        )
-        return []
+        raise RuntimeError(
+            f"OCR token confidence extraction failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
-    rows = []
+    tokens = []
 
-    for i, raw in enumerate(
-        data.get("text", [])
+    texts = data.get("text", [])
+    confidences = data.get("conf", [])
+
+    for text, confidence in zip(
+        texts,
+        confidences
     ):
-        word = (raw or "").strip()
+        text = str(text).strip()
+
+        if not text:
+            continue
 
         try:
-            conf = float(
-                data["conf"][i]
-            )
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            continue
 
-        except (ValueError, TypeError):
-            conf = -1
+        if confidence_value < 0:
+            continue
 
-        if word and conf >= 0:
-            rows.append(
-                {
-                    "text": word,
-                    "confidence": conf
-                }
-            )
+        tokens.append({
+            "text": text,
+            "confidence": confidence_value
+        })
 
-    return rows
+    return tokens

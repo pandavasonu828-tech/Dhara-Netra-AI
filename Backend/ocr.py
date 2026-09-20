@@ -1,15 +1,19 @@
 """Bounded OCR runtime for Dhara-Netra AI.
 
-The hosted prototype must fail safely on small/free instances.
-OCR is deliberately bounded by image size, page count and
-subprocess timeouts. PDF pages are rendered one at a time so
-a large PDF cannot be loaded into memory all at once.
+Optimized for small/free hosted instances.
+
+The OCR pipeline:
+- limits image dimensions
+- preprocesses images for faster OCR
+- uses a lightweight Tesseract page mode
+- performs only one OCR pass
+- processes PDF pages one at a time
+- gives useful error messages
 """
 
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import os
 import shutil
-import tempfile
 import pytesseract
 
 
@@ -18,11 +22,11 @@ import pytesseract
 # ---------------------------------------------------------
 
 MAX_OCR_DIMENSION = int(
-    os.environ.get("MAX_OCR_DIMENSION", "1400")
+    os.environ.get("MAX_OCR_DIMENSION", "1000")
 )
 
 OCR_TIMEOUT_SECONDS = int(
-    os.environ.get("OCR_TIMEOUT_SECONDS", "18")
+    os.environ.get("OCR_TIMEOUT_SECONDS", "20")
 )
 
 PDF_MAX_PAGES = int(
@@ -30,7 +34,15 @@ PDF_MAX_PAGES = int(
 )
 
 PDF_RENDER_SCALE = float(
-    os.environ.get("PDF_RENDER_SCALE", "1.25")
+    os.environ.get("PDF_RENDER_SCALE", "1.0")
+)
+
+# Keep OCR slightly below the hosted image limit.
+# This reduces CPU usage while preserving enough detail
+# for normal printed documents.
+OCR_TARGET_DIMENSION = min(
+    MAX_OCR_DIMENSION,
+    900
 )
 
 
@@ -73,6 +85,7 @@ def tesseract_status():
             "command": pytesseract.pytesseract.tesseract_cmd,
             "ocr_timeout_seconds": OCR_TIMEOUT_SECONDS,
             "max_ocr_dimension": MAX_OCR_DIMENSION,
+            "ocr_target_dimension": OCR_TARGET_DIMENSION,
             "pdf_max_pages": PDF_MAX_PAGES,
         }
 
@@ -84,6 +97,7 @@ def tesseract_status():
             "error": str(exc),
             "ocr_timeout_seconds": OCR_TIMEOUT_SECONDS,
             "max_ocr_dimension": MAX_OCR_DIMENSION,
+            "ocr_target_dimension": OCR_TARGET_DIMENSION,
             "pdf_max_pages": PDF_MAX_PAGES,
         }
 
@@ -92,16 +106,52 @@ def tesseract_status():
 # IMAGE SIZE LIMIT
 # ---------------------------------------------------------
 
-def _bound_image(image):
+def _bound_image(image, target=None):
     image = image.convert("RGB")
 
-    if max(image.size) > MAX_OCR_DIMENSION:
+    target = target or OCR_TARGET_DIMENSION
+
+    if max(image.size) > target:
         image.thumbnail(
-            (MAX_OCR_DIMENSION, MAX_OCR_DIMENSION),
+            (target, target),
             Image.Resampling.LANCZOS
         )
 
     return image
+
+
+# ---------------------------------------------------------
+# OCR PREPROCESSING
+# ---------------------------------------------------------
+
+def _preprocess_image(image):
+    """Prepare image for lightweight Tesseract OCR."""
+
+    image = _bound_image(
+        image,
+        OCR_TARGET_DIMENSION
+    )
+
+    # Convert to grayscale.
+    gray = ImageOps.grayscale(image)
+
+    # Improve contrast.
+    gray = ImageOps.autocontrast(
+        gray,
+        cutoff=1
+    )
+
+    # Slight sharpening.
+    gray = ImageEnhance.Sharpness(
+        gray
+    ).enhance(1.3)
+
+    # Small noise reduction.
+    gray = gray.filter(
+        ImageFilter.MedianFilter(size=3)
+    )
+
+    return gray
 
 
 # ---------------------------------------------------------
@@ -110,8 +160,12 @@ def _bound_image(image):
 
 def _load_image(image_path):
     try:
+        with Image.open(image_path) as source:
+            image = source.copy()
+
         return _bound_image(
-            Image.open(image_path)
+            image,
+            OCR_TARGET_DIMENSION
         )
 
     except Exception as exc:
@@ -125,34 +179,78 @@ def _load_image(image_path):
 # ---------------------------------------------------------
 
 def _run_ocr(image, timeout=None):
-    timeout = timeout or OCR_TIMEOUT_SECONDS
+    timeout = (
+        timeout
+        if timeout is not None
+        else OCR_TIMEOUT_SECONDS
+    )
 
     try:
+        # PSM 6 is lighter than PSM 3 for ordinary
+        # scanned forms and document pages.
         return pytesseract.image_to_string(
             image,
-            config="--psm 3",
+            config="--oem 3 --psm 6",
             timeout=timeout,
         ).strip()
 
     except pytesseract.TesseractNotFoundError as exc:
         raise RuntimeError(
-            "Tesseract OCR is not available in the server runtime."
+            "Tesseract OCR is not available "
+            "in the server runtime."
         ) from exc
 
     except RuntimeError as exc:
-        if "timeout" in str(exc).lower():
+        message = str(exc)
+
+        if "timeout" in message.lower():
             raise TimeoutError(
                 f"OCR timed out after {timeout} seconds"
             ) from exc
 
         raise RuntimeError(
-            f"Tesseract OCR failed: {exc}"
+            f"Tesseract OCR failed: {message}"
         ) from exc
 
     except Exception as exc:
         raise RuntimeError(
-            f"Tesseract OCR failed: {exc}"
+            f"Tesseract OCR failed: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
+
+
+# ---------------------------------------------------------
+# OCR ONE IMAGE
+# ---------------------------------------------------------
+
+def _extract_image_text(image, source_name="image"):
+    """Run exactly one optimized OCR pass."""
+
+    processed = _preprocess_image(image)
+
+    try:
+        text = _run_ocr(
+            processed,
+            timeout=OCR_TIMEOUT_SECONDS
+        )
+
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"OCR timed out after "
+            f"{OCR_TIMEOUT_SECONDS} seconds for "
+            f"{source_name}. "
+            f"The hosted OCR engine could not process "
+            f"this document within the available "
+            f"CPU limit."
+        ) from exc
+
+    if not text:
+        raise RuntimeError(
+            f"OCR completed but found no readable "
+            f"text in {source_name}."
+        )
+
+    return text
 
 
 # ---------------------------------------------------------
@@ -167,6 +265,8 @@ def _extract_pdf_text(pdf_path):
             "PDF support is unavailable in this deployment."
         ) from exc
 
+    doc = None
+
     try:
         doc = fitz.open(pdf_path)
 
@@ -176,6 +276,7 @@ def _extract_pdf_text(pdf_path):
             )
 
         total_pages = doc.page_count
+
         page_count = min(
             total_pages,
             PDF_MAX_PAGES
@@ -201,43 +302,25 @@ def _extract_pdf_text(pdf_path):
                 pix.samples
             )
 
-            image = _bound_image(image)
+            image = _bound_image(
+                image,
+                OCR_TARGET_DIMENSION
+            )
 
-            try:
-                text = _run_ocr(image)
-
-            except TimeoutError:
-
-                # A PDF page that is too complex gets
-                # one smaller, faster OCR pass.
-                image.thumbnail(
-                    (1000, 1000),
-                    Image.Resampling.LANCZOS
-                )
-
-                try:
-                    text = _run_ocr(
-                        image,
-                        timeout=8
-                    )
-
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"OCR fallback failed for PDF page "
-                        f"{index + 1}: "
-                        f"{type(exc).__name__}: {exc}"
-                    ) from exc
+            text = _extract_image_text(
+                image,
+                source_name=f"PDF page {index + 1}"
+            )
 
             if text:
                 chunks.append(
                     f"[PAGE {index + 1}]\n{text}"
                 )
 
-        doc.close()
-
         if not chunks:
             raise RuntimeError(
-                "OCR found no readable text in the uploaded PDF."
+                "OCR found no readable text "
+                "in the uploaded PDF."
             )
 
         if total_pages > PDF_MAX_PAGES:
@@ -254,8 +337,16 @@ def _extract_pdf_text(pdf_path):
 
     except Exception as exc:
         raise RuntimeError(
-            f"Unable to process PDF: {exc}"
+            f"Unable to process PDF: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
+
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------
@@ -263,6 +354,17 @@ def _extract_pdf_text(pdf_path):
 # ---------------------------------------------------------
 
 def extract_text(file_path):
+
+    if not file_path:
+        raise RuntimeError(
+            "No document path was provided for OCR."
+        )
+
+    if not os.path.isfile(file_path):
+        raise RuntimeError(
+            f"Uploaded document was not found: "
+            f"{file_path}"
+        )
 
     ext = os.path.splitext(
         file_path
@@ -272,41 +374,13 @@ def extract_text(file_path):
     if ext == ".pdf":
         return _extract_pdf_text(file_path)
 
-    # JPG / PNG / other image
+    # IMAGE
     image = _load_image(file_path)
 
-    try:
-        text = _run_ocr(image)
-
-    except TimeoutError:
-
-        # Smaller fallback image.
-        fallback = image.copy()
-
-        fallback.thumbnail(
-            (1000, 1000),
-            Image.Resampling.LANCZOS
-        )
-
-        try:
-            text = _run_ocr(
-                fallback,
-                timeout=8
-            )
-
-        except Exception as exc:
-            raise RuntimeError(
-                f"OCR fallback failed: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-
-    if not text:
-        raise RuntimeError(
-            "OCR returned no readable text from the "
-            "uploaded document. Try a clearer scan."
-        )
-
-    return text
+    return _extract_image_text(
+        image,
+        source_name=os.path.basename(file_path)
+    )
 
 
 # ---------------------------------------------------------
@@ -314,11 +388,10 @@ def extract_text(file_path):
 # ---------------------------------------------------------
 
 def extract_ocr_token_confidence(file_path):
-    """Supplementary confidence data.
+    """Extract OCR token confidence when explicitly enabled.
 
-    It is intentionally disabled by default because
-    image_to_data() requires another complete Tesseract
-    OCR pass and can consume additional resources.
+    Disabled by default because image_to_data() performs
+    another complete Tesseract OCR pass.
     """
 
     if os.environ.get(
@@ -329,13 +402,27 @@ def extract_ocr_token_confidence(file_path):
 
     image = _load_image(file_path)
 
+    processed = _preprocess_image(image)
+
     try:
         data = pytesseract.image_to_data(
-            image,
-            config="--psm 3",
+            processed,
+            config="--oem 3 --psm 6",
             output_type=pytesseract.Output.DICT,
             timeout=OCR_TIMEOUT_SECONDS
         )
+
+    except pytesseract.TesseractNotFoundError as exc:
+        raise RuntimeError(
+            "Tesseract OCR is not available "
+            "in the server runtime."
+        ) from exc
+
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"OCR token confidence extraction failed: "
+            f"{exc}"
+        ) from exc
 
     except Exception as exc:
         raise RuntimeError(
@@ -345,8 +432,15 @@ def extract_ocr_token_confidence(file_path):
 
     tokens = []
 
-    texts = data.get("text", [])
-    confidences = data.get("conf", [])
+    texts = data.get(
+        "text",
+        []
+    )
+
+    confidences = data.get(
+        "conf",
+        []
+    )
 
     for text, confidence in zip(
         texts,
@@ -358,8 +452,13 @@ def extract_ocr_token_confidence(file_path):
             continue
 
         try:
-            confidence_value = float(confidence)
-        except (TypeError, ValueError):
+            confidence_value = float(
+                confidence
+            )
+        except (
+            TypeError,
+            ValueError
+        ):
             continue
 
         if confidence_value < 0:
